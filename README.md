@@ -74,23 +74,36 @@ docker run -d --name napcat --restart=always \
 
 ### 2. 安装插件
 
+本插件**不在 npm 上**，从仓库或 Release 附件装（仓库地址：<https://github.com/arrow1031/dsh-qq-bot>）：
+
 ```sh
-dsh plugin --profile web add /path/to/dsh-qq-bot-<版本>.tgz
+# 方式一：直接从 GitHub 仓库装（默认跟 main 分支）
+dsh plugin --profile web add github:arrow1031/dsh-qq-bot
+
+# 想锁版本就用 tag（推荐生产环境）
+dsh plugin --profile web add github:arrow1031/dsh-qq-bot#v0.6.1
+
+# 方式二：用 Release 里打好的 tarball（固定版本）
+dsh plugin --profile web add \
+  https://github.com/arrow1031/dsh-qq-bot/releases/download/v0.6.1/dsh-qq-bot-0.6.1.tgz
+
+# 方式三：本地 tarball（自己改了代码之后）
+npm pack
+dsh plugin --profile web add ./dsh-qq-bot-0.6.1.tgz
 ```
 
-`dsh plugin` 本质是 pnpm 的前置封装：装完包后，它会**自动把声明了 `dsh.bundle.patch` 的依赖加入 profile 的层栈**（本包的 package.json 已声明）。然后重启 `dsh web` 生效。
+`--profile` 换成你实际在用的 profile：**桌面版是 `--profile desktop`**，`dsh web` 部署一般是 `--profile web`。
+
+`dsh plugin` 本质是 pnpm 的前置封装：装完包后，它会**自动把声明了 `dsh.bundle.patch` 的依赖加入 profile 的层栈**（本包的 package.json 已声明），并连同唯一的运行时依赖 `@deepseek-ai/schemastery` 一起装上。装完**重启 DSH（桌面版重启应用 / CLI 重启 `dsh web`）**生效。
+
+> **版本要求**：`0.6.1` 及以后要求 **DSH ≥ 0.1.7**。DSH 0.1.6 及更早请用 `0.6.0`。
 
 > **升级注意（重要）**：`dsh plugin add` 转发给 pnpm，而 pnpm 按 tarball 的**完整性哈希**缓存。
-> 改了代码必须**打成新的版本号文件名**再装（0.3.0 → 0.3.1）；沿用同一个文件名会被判成“lockfile 已最新”而跳过，装的还是旧内容。
+> 改了代码必须**打成新的版本号文件名**再装（0.6.0 → 0.6.1）；沿用同一个文件名会被判成「lockfile 已最新」而跳过，装的还是旧内容。
 > `npm pack` 默认就带版本号，所以正常发版流程不会踩到。
->
-> 本插件有**一个运行时依赖** `@deepseek-ai/schemastery`（`Config` schema 必需，DSH 0.1.7 起
-> 设置表单就靠它）。`dsh plugin add` 会连同它一起装上，不需要手工处理。
 
-> **客户端改动要多一步**：`lib/client.js` 是浏览器侧代码，装好并重启 `dsh web` 之后，
+> **客户端改动要多一步**：`lib/client.js` 是浏览器侧代码，装好并重启之后，
 > **还要刷新浏览器页面**才会加载新的客户端 bundle。
-
-不想打包也行，直接 `dsh plugin --profile web add <你的 git 仓库或 tarball 地址>`。
 
 ### 3. 在 QQ 里试
 
