@@ -13,9 +13,10 @@
  */
 
 import { spawn } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import path from 'node:path';
 import fs from 'node:fs';
+import os from 'node:os';
 import process from 'node:process';
 import { startMockOneBot } from './mock-onebot.mjs';
 
@@ -40,10 +41,23 @@ async function waitFor(fn, timeoutMs, label) {
   }
 }
 
-const PROFILE_MODULES = '/home/dsh/.dsh/profiles/node_modules';
+// 装到 DSH profile 之后，@deepseek-ai/* 由 DSH 运行时解析。这里允许用
+// DSH_PROFILE_MODULES 显式指向 profile 的 node_modules 来复现那种布局；
+// 找不到就跳过依赖宿主服务的断言，裸克隆照样能跑。
+const PROFILE_MODULES = process.env.DSH_PROFILE_MODULES
+  ?? path.join(process.env.DSH_HOME ?? path.join(os.homedir(), '.dsh'), 'profiles', 'node_modules');
 const linkPath = path.join(PKG_ROOT, 'node_modules');
 let createdLink = false;
-if (!fs.existsSync(linkPath) && fs.existsSync(PROFILE_MODULES)) { fs.symlinkSync(PROFILE_MODULES, linkPath, 'dir'); createdLink = true; }
+if (!fs.existsSync(linkPath) && fs.existsSync(PROFILE_MODULES)) {
+  fs.symlinkSync(PROFILE_MODULES, linkPath, process.platform === 'win32' ? 'junction' : 'dir');
+  createdLink = true;
+}
+// 插件现在静态 import @deepseek-ai/schemastery（Config schema 必需）。
+try { await import.meta.resolve('@deepseek-ai/schemastery'); }
+catch {
+  console.log('缺少 @deepseek-ai/schemastery —— 请先在本目录执行 npm install / pnpm install。');
+  process.exit(2);
+}
 
 const mock = await startMockOneBot({ quiet: true });
 mock.setMemberRole('66666', 'owner');
@@ -87,6 +101,19 @@ function fakeAgent(sessionId) {
 }
 
 const ctx = {
+  fiber: { marker: 'plugin-fiber' },
+  // DSH ≥ 0.1.7：插件用 inject(['settings']) + settings.configure() 声明设置页归属
+  inject(names, callback) {
+    if (Array.isArray(names) && names.includes('settings')) {
+      callback({
+        effect(fn) { const d = fn(); if (typeof d === 'function') disposers.push(d); return () => {}; },
+        settings: { configure() { return () => {}; } },
+      });
+    }
+    return () => {};
+  },
+  // 配置热更新通道（本套测试不验证重启行为，只需接口存在）
+  on() { return () => {}; },
   get: () => undefined,
   subprocess: {
     async resolveExecutable() { return process.execPath; },
@@ -133,7 +160,7 @@ const denied = (r) => r.startsWith('【拒绝】');
 const done = (r) => r.startsWith('【已执行】');
 
 try {
-  const mod = await import(path.join(PKG_ROOT, 'lib', 'index.js'));
+  const mod = await import(pathToFileURL(path.join(PKG_ROOT, 'lib', 'index.js')).href);
   await mod.apply(ctx, {
     onebot: { wsUrl: mock.wsUrl, httpUrl: mock.httpUrl },
     group: { enabled: true, allow: [], requireAt: false },
@@ -256,7 +283,10 @@ try {
   for (const d of disposers) { try { d(); } catch { /* ignore */ } }
   await sleep(300);
   await mock.close();
-  if (createdLink) { try { fs.rmSync(linkPath); } catch { /* ignore */ } }
+  if (createdLink) {
+    // 只删链接本身：对 junction 用 rmSync(recursive) 会把目标目录删空。
+    try { if (process.platform === 'win32') fs.rmdirSync(linkPath); else fs.unlinkSync(linkPath); } catch { /* ignore */ }
+  }
 }
 
 const passed = results.filter(Boolean).length;

@@ -15,15 +15,20 @@
  */
 
 import { spawn } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import path from 'node:path';
 import fs from 'node:fs';
+import os from 'node:os';
 import process from 'node:process';
 import { startMockOneBot } from './mock-onebot.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const PKG_ROOT = path.join(here, '..');
-const PROFILE_MODULES = '/home/dsh/.dsh/profiles/node_modules';
+// 装到 DSH profile 之后，@deepseek-ai/dsh-tools 由 DSH 运行时解析。这里允许用
+// DSH_PROFILE_MODULES 显式指向 profile 的 node_modules 来复现那种布局；
+// 解析不到就跳过依赖宿主服务的断言（裸克隆照样跑）。
+const PROFILE_MODULES = process.env.DSH_PROFILE_MODULES
+  ?? path.join(process.env.DSH_HOME ?? path.join(os.homedir(), '.dsh'), 'profiles', 'node_modules');
 
 let failures = 0;
 const results = [];
@@ -47,8 +52,14 @@ async function waitFor(fn, timeoutMs, label) {
 const linkPath = path.join(PKG_ROOT, 'node_modules');
 let createdLink = false;
 if (!fs.existsSync(linkPath) && fs.existsSync(PROFILE_MODULES)) {
-  fs.symlinkSync(PROFILE_MODULES, linkPath, 'dir');
+  fs.symlinkSync(PROFILE_MODULES, linkPath, process.platform === 'win32' ? 'junction' : 'dir');
   createdLink = true;
+}
+// 插件现在静态 import @deepseek-ai/schemastery（Config schema 必需）。
+try { await import.meta.resolve('@deepseek-ai/schemastery'); }
+catch {
+  console.log('缺少 @deepseek-ai/schemastery —— 请先在本目录执行 npm install / pnpm install。');
+  process.exit(2);
 }
 
 // 工具注册需要 @deepseek-ai/dsh-tools（只在 DSH 部署里可解析）。裸克隆下跳过相关断言，
@@ -56,6 +67,13 @@ if (!fs.existsSync(linkPath) && fs.existsSync(PROFILE_MODULES)) {
 let hasDshTools = true;
 try { await import.meta.resolve("@deepseek-ai/dsh-tools"); } catch { hasDshTools = false; }
 if (!hasDshTools) console.log("提示：解析不到 @deepseek-ai/dsh-tools，将跳过工具注册断言（适配器/路由断言不受影响）");
+
+// 插件用 console.log / console.error 汇报状态；抓下来做行为断言（适配器是否重启）。
+const logLines = [];
+const realLog = console.log;
+const realErr = console.error;
+console.log = (...args) => { logLines.push(args.map(String).join(' ')); realLog(...args); };
+console.error = (...args) => { logLines.push(args.map(String).join(' ')); realErr(...args); };
 
 const mock = await startMockOneBot({ quiet: true });
 console.log('假 OneBot：http=' + mock.httpUrl + ' ws=' + mock.wsUrl);
@@ -99,22 +117,36 @@ function fakeAgent(sessionId) {
   return agent;
 }
 
-// 设置服务桩：记录命名空间注册，并提供 get/watch，让 Host 的设置集成路径被覆盖。
-const registeredSettings = [];
-const settingsWatchers = [];
+// 设置服务桩（DSH ≥ 0.1.7 契约）：插件不再自己 register 命名空间 —— 那个 API 在
+// 0.1.7 被删掉了。现在 DSH 直接拿插件导出的 schemastery Config 当表单来源，插件只需
+// 声明「设置页由我自带的选项卡负责」（configure({auto:false})）。
+const configuredSettings = [];
 const settingsStub = {
-  register(ns, schema, options) {
-    const resolved = schema(Object.assign({}, options && options.base));
-    registeredSettings.push({ ns, resolved, schema });
-    return {
-      get: () => resolved,
-      watch: (callback) => { settingsWatchers.push(callback); return () => {}; },
-    };
+  configure(presentation, owner) {
+    configuredSettings.push({ presentation, owner });
+    return () => {};
   },
 };
 
+// loader/volatile-update 的监听者：cordis-plugin-loader 在 volatile 字段变化时就地
+// 更新运行中 fiber 的引用并触发它，不重挂插件。
+const volatileUpdateHandlers = [];
+
 const ctx = {
-  get: (name) => (name === 'settings' ? settingsStub : undefined),
+  fiber: { marker: 'plugin-fiber' },
+  inject(names, callback) {
+    if (Array.isArray(names) && names.includes('settings')) {
+      callback({
+        effect(fn) { const d = fn(); if (typeof d === 'function') disposers.push(d); return () => {}; },
+        settings: settingsStub,
+      });
+    }
+    return () => {};
+  },
+  on(event, handler) {
+    if (event === 'loader/volatile-update') volatileUpdateHandlers.push(handler);
+    return () => {};
+  },
   subprocess: {
     async resolveExecutable() { return process.execPath; },
     spawn(spec) {
@@ -141,59 +173,84 @@ const ctx = {
 };
 
 try {
-  const mod = await import(path.join(PKG_ROOT, 'lib', 'index.js'));
+  const mod = await import(pathToFileURL(path.join(PKG_ROOT, 'lib', 'index.js')).href);
   check('模块导出了 name/inject/apply', mod.name === 'dsh-qq-bot' && Array.isArray(mod.inject) && typeof mod.apply === 'function');
   check('inject 声明了 subprocess/sessionController/timer',
     mod.inject.includes('subprocess') && mod.inject.includes('sessionController') && mod.inject.includes('timer'));
 
 
   console.log('\n1. 加载插件（正向 WS 连假 OneBot）');
-  await mod.apply(ctx, {
+  // 按 Cordis 的做法求值配置：Config['~standard'].validate(raw)，volatile 字段变成引用。
+  const validated = mod.Config['~standard'].validate({
     onebot: { wsUrl: mock.wsUrl, httpUrl: mock.httpUrl },
     reply: { ackAfterMs: 0 },
   });
+  check('Config.validate 没有 issues', validated.issues === undefined, JSON.stringify(validated.issues));
+  const liveConfig = validated.value;
+
+  await mod.apply(ctx, liveConfig);
   await waitFor(() => mock.clientCount() === 1, 10000, '适配器连上假 OneBot');
   check('适配器已连上假 OneBot', mock.clientCount() === 1);
 
-  console.log('\n2. Host 设置命名空间');
-  check('注册了 qq-bot 设置命名空间', registeredSettings.length === 1 && registeredSettings[0].ns === 'qq-bot',
-    JSON.stringify(registeredSettings.map((r) => r.ns)));
-  check('设置默认值已解析（含 onebot/group/reply）',
-    Boolean(registeredSettings[0] && registeredSettings[0].resolved.onebot && registeredSettings[0].resolved.group
-      && registeredSettings[0].resolved.reply));
-  check('设置了变更监听', settingsWatchers.length === 1, String(settingsWatchers.length));
+  console.log('\n2. Host 配置契约（DSH ≥ 0.1.7：Config schema 取代 settings.register）');
+  check('导出了 schemastery Config',
+    Boolean(mod.Config) && mod.Config['~standard'] !== undefined && mod.Config['~standard'].vendor === 'schemastery',
+    JSON.stringify(mod.Config && mod.Config['~standard'] && mod.Config['~standard'].vendor));
+  check('配置默认值已解析（含 onebot/group/reply）',
+    Boolean(liveConfig.onebot && liveConfig.group && liveConfig.reply));
+  check('行配置覆盖了默认值',
+    liveConfig.onebot.wsUrl.get() === mock.wsUrl && liveConfig.reply.ackAfterMs.get() === 0);
+  check('声明了「设置页由本插件自带的选项卡负责」(auto:false)',
+    configuredSettings.length === 1 && configuredSettings[0].presentation.auto === false
+      && configuredSettings[0].owner === ctx.fiber,
+    JSON.stringify(configuredSettings.map((c) => c.presentation)));
 
-  // settings.describe() 会对每个命名空间调 schema.toJSON()，并且会按 schema 结构走一遍
-  // redactSecrets（只读 node.meta?.role / node.type / node.dict / node.inner）。
-  const registeredSchema = registeredSettings[0] && registeredSettings[0].schema;
-  check('schema 提供 toJSON（否则 describe 会抛 schema.toJSON is not a function）',
-    Boolean(registeredSchema) && typeof registeredSchema.toJSON === 'function');
-  let schemaJson = null;
-  try { schemaJson = registeredSchema.toJSON(); JSON.stringify(schemaJson); } catch (error) { schemaJson = null; }
-  check('toJSON 返回可 JSON 序列化的值', schemaJson !== null && typeof schemaJson === 'object', JSON.stringify(schemaJson));
+  // 设置页能不能出现、能不能保存，全看字段是不是 volatile：
+  //   * dsh-settings 的 volatileForm() 只投影 volatile 字段（一个都没有 => 整个条目不出现）
+  //   * write() 对非 volatile 路径直接抛 "Config field ... is not volatile"
+  // 所以直接从 lib/client.js 里抠出 FIELDS 的 path 逐条核对，避免两边各写一份而漂移。
+  const clientSource = fs.readFileSync(path.join(PKG_ROOT, 'lib', 'client.js'), 'utf-8');
+  const fieldPaths = [];
+  for (const match of clientSource.matchAll(/\{\s*path:\s*\[([^\]]+)\]/g)) {
+    const parts = [...match[1].matchAll(/'([^']*)'/g)].map((x) => x[1]);
+    if (parts.length > 0) fieldPaths.push(parts);
+  }
+  check('从 client.js 抠出了表单字段', fieldPaths.length >= 30, String(fieldPaths.length));
 
-  // 复刻 dsh-settings 的 redact walker，确认不会抛、也不会改坏值
-  const walkRedact = (node, value) => {
-    if (node === undefined || node === null) return value;
-    if (node.meta !== undefined && node.meta !== null && node.meta.role === 'secret') return undefined;
-    if (node.type === 'object') {
-      const properties = node.dict === undefined ? {} : node.dict;
-      const isRec = typeof value === 'object' && value !== null && !Array.isArray(value);
-      const source = isRec ? value : undefined;
-      const rebuilt = {};
-      if (source !== undefined) { for (const key of Object.keys(source)) { if (Object.prototype.hasOwnProperty.call(properties, key)) continue; rebuilt[key] = source[key]; } }
-      for (const key of Object.keys(properties)) { const stripped = walkRedact(properties[key], source === undefined ? undefined : source[key]); if (stripped !== undefined) rebuilt[key] = stripped; }
-      return rebuilt;
-    }
-    if (node.type === 'dict') { if (typeof value !== 'object' || value === null || Array.isArray(value)) return value; const rebuilt = {}; for (const key of Object.keys(value)) rebuilt[key] = walkRedact(node.inner, value[key]); return rebuilt; }
-    if (node.type === 'array') { if (!Array.isArray(value)) return value; return value.map((entry) => walkRedact(node.inner, entry)); }
-    return value;
+  const isVolatilePath = (schema, p) => {
+    if (schema.meta !== undefined && schema.meta.volatile) return true;
+    const [key, ...rest] = p;
+    const child = key === undefined ? undefined : (schema.dict === undefined ? {} : schema.dict)[key];
+    return child !== undefined && isVolatilePath(child, rest);
   };
-  let walked = null; let walkError = null;
-  try { walked = walkRedact(registeredSchema, registeredSettings[0].resolved); } catch (error) { walkError = error; }
-  check('redactSecrets 能走通我们的 schema', walkError === null, walkError === null ? '' : String(walkError && walkError.message));
-  check('redact 遍历不改变值', JSON.stringify(walked) === JSON.stringify(registeredSettings[0].resolved));
-  check('工作目录来自传入配置', registeredSettings[0].resolved.workspace === '' || typeof registeredSettings[0].resolved.workspace === 'string');
+  const notVolatile = fieldPaths.filter((p) => !isVolatilePath(mod.Config, p)).map((p) => p.join('.'));
+  check('设置页里的每个字段都是 volatile（否则保存会被拒）', notVolatile.length === 0, notVolatile.join(', '));
+
+  const volatileForm = (schema) => {
+    if (schema.meta !== undefined && schema.meta.volatile) return schema;
+    if (schema.type === 'object') {
+      const dict = {};
+      for (const [key, child] of Object.entries(schema.dict === undefined ? {} : schema.dict)) {
+        const field = volatileForm(child);
+        if (field !== undefined) dict[key] = field;
+      }
+      return Object.keys(dict).length > 0 ? { type: 'object', dict } : undefined;
+    }
+    return undefined;
+  };
+  check('volatileForm(Config) 非空（否则设置页里根本不会出现这个条目）', volatileForm(mod.Config) !== undefined);
+
+  check('accessToken 声明为 secret（值不下发到浏览器）',
+    mod.Config.dict.onebot.dict.accessToken.meta.role === 'secret');
+  check('内部字段不进设置页（restart / adapterPath / firstTurnHint 非 volatile）',
+    !isVolatilePath(mod.Config, ['restart', 'baseMs'])
+      && !isVolatilePath(mod.Config, ['adapterPath'])
+      && !isVolatilePath(mod.Config, ['reply', 'firstTurnHint']));
+
+  let schemaJson = null;
+  try { schemaJson = mod.Config.toJSON(); JSON.stringify(schemaJson); } catch (error) { schemaJson = null; }
+  check('Config.toJSON() 可 JSON 序列化（describe 需要）', schemaJson !== null && typeof schemaJson === 'object');
+  check('工作目录配置项存在', typeof liveConfig.workspace.get() === 'string');
 
   console.log('\n2. 动态工具注册（走真的 defineTool）');
   const tool = registeredTools.find((t) => t.name === 'qqbot');
@@ -244,7 +301,29 @@ try {
   }
   if (status === null) check('（跳过）status 动作需要 dsh-tools', true);
 
-  console.log('\n6. 卸载');
+  console.log('\n6. 配置热更新（volatile 就地更新 + loader/volatile-update）');
+  const VOLATILE_WRITE = Symbol.for('cosmokit.volatile.write');
+  check('volatile 引用带共享写符号', typeof liveConfig.onebot.accessToken[VOLATILE_WRITE] === 'function');
+  check('注册了 loader/volatile-update 监听', volatileUpdateHandlers.length === 1, String(volatileUpdateHandlers.length));
+
+  const startsBefore = logLines.filter((line) => line.includes('适配器已启动')).length;
+  // 模拟 loader：就地把新值写进引用，然后发事件（不重挂插件）
+  liveConfig.onebot.accessToken[VOLATILE_WRITE]('fresh-token');
+  for (const handler of volatileUpdateHandlers) handler([['onebot', 'accessToken']]);
+  await waitFor(() => logLines.filter((line) => line.includes('适配器已启动')).length > startsBefore, 10000, '连接配置变化后重启适配器');
+  check('连接配置变化 -> 重启适配器', logLines.filter((line) => line.includes('适配器已启动')).length > startsBefore);
+  await sleep(700);
+  check('重启后适配器重新连上假 OneBot', mock.clientCount() === 1, 'clients=' + mock.clientCount());
+
+  const startsAfterTransport = logLines.filter((line) => line.includes('适配器已启动')).length;
+  liveConfig.reply.maxChars[VOLATILE_WRITE](999);
+  for (const handler of volatileUpdateHandlers) handler([['reply', 'maxChars']]);
+  await sleep(900);
+  check('非连接类改动不重启适配器',
+    logLines.filter((line) => line.includes('适配器已启动')).length === startsAfterTransport,
+    String(logLines.filter((line) => line.includes('适配器已启动')).length - startsAfterTransport));
+
+  console.log('\n7. 卸载');
   for (const d of disposers) { try { d(); } catch (error) { console.log('  disposer 抛错：' + error.message); } }
   await sleep(600);
   check('卸载后适配器进程已终止', mock.clientCount() === 0, 'clients=' + mock.clientCount());
@@ -253,7 +332,10 @@ try {
   console.log('\n错误：' + (error && error.stack ? error.stack : String(error)));
 } finally {
   await mock.close();
-  if (createdLink) { try { fs.rmSync(linkPath); } catch { /* ignore */ } }
+  if (createdLink) {
+    // 只删链接本身：对 junction 用 rmSync(recursive) 会把目标目录删空。
+    try { if (process.platform === 'win32') fs.rmdirSync(linkPath); else fs.unlinkSync(linkPath); } catch { /* ignore */ }
+  }
 }
 
 const passed = results.filter(Boolean).length;

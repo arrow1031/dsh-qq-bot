@@ -42,7 +42,7 @@ DSH Agent
 | `lib/client.js` | 浏览器侧：设置面板的一个选项卡 | 加/改设置项时 |
 | `cordis.patch.yml` | bundle 补丁，把插件插进 profile 组合树 | 几乎不动 |
 | `test/mock-onebot.mjs` | 零依赖 OneBot 11 模拟器（手写 RFC 6455 帧编解码） | 要模拟新动作/新事件时 |
-| `test/test-*.mjs` | 5 个测试套件，共 123 项 | 每次改动后 |
+| `test/test-*.mjs` | 5 个测试套件，共 124 项 | 每次改动后 |
 | `examples/dynamic-package-host.js` | 同一套逻辑的「动态 Package」形态，不装包即可在运行中的 DSH 里跑 | 想快速试改时 |
 
 **只有 `lib/` 和 `cordis.patch.yml` 会进 npm 包**（见 `package.json` 的 `files`）。测试与示例只在仓库里。
@@ -88,19 +88,36 @@ handleAdminCommand
 
 ## 3. 关键数据结构
 
-### 3.1 配置：两层
+### 3.1 配置：一个 schema，三层来源
 
-- **base 层**：`cordis.patch.yml` 里那行 `config:`（或用户在 profile 的 `cordis.patch.yml` 里覆盖的）
-- **用户层**：设置面板写入的设置文档
+DSH ≥ 0.1.7 的写法：插件**导出 schemastery 的 `Config`**，DSH 拿它当设置表单，把
+「composition 行配置 → profile 的 `cordis.patch.yml` → schema 默认值」合并求值后，
+把**求值结果**作为 `apply(ctx, config)` 的第二个参数交给插件。
 
-两者合并后交给 **schema** 求值：`settings.register('qq-bot', (raw) => mergeConfig(DEFAULTS, raw ?? {}), { base: ROW_CONFIG })`。
+```js
+export const Config = Schema.object({
+  mode: Schema.union([Schema.const('forward'), Schema.const('reverse')]).default('forward').volatile(),
+  onebot: Schema.object({ wsUrl: Schema.string().default('ws://127.0.0.1:3001').volatile(), /* … */ }),
+  // …
+});
+```
 
-> ⚠️ **schema 必须同时是「可调用的解析函数」和「可 JSON 化的对象」**。
-> `settings.describe()` 会无条件调用 `schema.toJSON()`，漏了它设置页就报
-> `schema.toJSON is not a function`。见 `lib/index.js` 里注册命名空间那几行。
+三条必须记住的规则：
 
-`CONFIG` 是个 `let`，设置变更时由 `resolveConfig()` 整体刷新——所以你能在任意函数里
-直接读 `CONFIG.xxx` 而永远拿到最新值，不必到处传参。
+1. **可编辑字段必须标 `.volatile()`**。`settings` 的 `volatileForm()` 只投影 volatile 字段；
+   一个 volatile 字段都没有时 `describe()` 直接跳过这个条目——**设置页里根本不会出现它**。
+   `write()` 也会对非 volatile 路径抛 `Config field "x" is not volatile`。
+2. **volatile 字段在运行时是引用**，不是值：`config.onebot.wsUrl.get()`。`lib/index.js` 里的
+   `plainConfig()` 把整棵配置还原成普通对象，再和 `DEFAULTS` 合并。
+3. **volatile-only 变更不会重挂插件**。`cordis-plugin-loader` 只就地更新运行中 fiber 的配置引用，
+   然后发 `loader/volatile-update`。所以插件自己监听该事件刷新 `CONFIG`，并决定何时重启适配器。
+
+> ⚠️ `adapterPath` / `nodePath` / `restart` / `reply.firstTurnHint` 故意**不标 volatile**：
+> 它们不进设置页，改动走「整体重挂插件」这条更稳的路径。
+
+`CONFIG` 是个 `let`，由 `resolveConfig()` 整体刷新——所以你能在任意函数里直接读 `CONFIG.xxx`
+而永远拿到最新值，不必到处传参。`workspace` / `adapterPath` 这类值用 `currentWorkspace()` /
+`currentAdapterPath()` 现取，避免快照过期。
 
 ### 3.2 会话条目 `state.convos`
 
@@ -168,9 +185,11 @@ key 形如 `group-33333`、`private-22222`（或分流时的 `group-33333@guest`
 | 标志位在 `runTurn` 内设置 | 在接收入口设会被排队的两条消息（先拥有者后访客）互相覆盖，导致用错权限 | — |
 | 指令严格匹配 | 防止聊天里夹带 `/mute …` 被误执行 | — |
 | `reply` 段不写进正文 | 写 `[回复]` 会让「回复某条消息 + `/recall`」的正文以 `[回复]` 开头，**斜杠就不在首位**，指令永远匹配不上 | 这是实测出来的 bug |
+| 设置改成 `Config` + `.volatile()` | 0.1.7 的 `settings` 直接读插件条目的 `Config` schema，`settings.register` 已删除 | 不标 `.volatile()` 的字段不进表单、也存不下去；没有 volatile 字段则整个条目不出现 |
+| 设置命名空间 = **profile 条目 id** | `describe()` 用 `entry.options.id` 当 `ns` | 0.1.6 的自定义命名空间（`qq-bot`）在 0.1.7 上找不到任何东西；客户端因此改成 `dsh-qq-bot` 并带回退匹配 |
 | `access_token` 标为 schema 的 `secret` | 值不下发到浏览器；界面渲染成只写输入框 | 只写字段读回来是 `undefined` 而输入框是 `''`，按普通 diff 会提交空值**把 token 清空**，所以客户端有专门护栏 |
 | 客户端 bundle 手写 | 只要 `require('react')`，格式是 `window.__ModuleLoader__.load({id,factory})`，**不需要打包器** | — |
-| `dsh.client.inject` 留空 | `dsh-at-file` 声明的那几个 client 包名在本地安装里并不存在（是发布名），声明了可能解析失败 | 改为惰性解析设置 API + 三重回退，拿不到也只显示错误、不会静默消失 |
+| `dsh.client.inject` 只声明 `@deepseek-ai/dsh-client-ui-settings` | 该包声明 `settings.section` 插槽；运行时 `inject` 还必须带上 `remote` 与 `remote.settings` —— `dsh-client-ui-settings` 明确要求每个使用方自己声明它们 | 不声明就拿不到设置 Remote，选项卡会一直显示「拿不到设置服务」 |
 
 ---
 
@@ -232,10 +251,11 @@ if (verb === 'warn') {
 
 ### 5.5 加一个设置项
 
-两处都要改，否则界面里看不到：
+**三处都要改**，少一处就看不到或存不下去：
 
-1. `lib/index.js` 的 `DEFAULTS` 加默认值（决定 Host 侧读得到什么）
-2. `lib/client.js` 的 `FIELDS` 加一行：
+1. `lib/index.js` 的 `DEFAULTS` 加默认值（离线兜底）
+2. `lib/index.js` 的 `Config` schema 加同名同路径的字段，**并标 `.volatile()`**（决定设置页能不能出现、能不能保存）
+3. `lib/client.js` 的 `FIELDS` 加一行：
 
 ```js
 { path: ['reply', 'foo'], label: '显示名', kind: 'bool', hint: '说明文字' },
@@ -244,7 +264,10 @@ if (verb === 'warn') {
 `kind` 可选：`bool` / `text` / `password` / `number` / `select`（要配 `options`）/ `list`（逗号分隔数组）。
 保存时会按字段算 diff，用 `mutate` 的路径操作下发，带 `revision` 做乐观并发。
 
-> 客户端改动后要**刷新浏览器页面**才生效；Host 改动要**重启 `dsh web`**。
+> 客户端改动后要**刷新浏览器页面**才生效；Host 改动要**重启 `dsh web`**（volatile 字段之外的改动会重挂插件）。
+>
+> `test-plugin.mjs` 里有一条契约断言：它会从 `lib/client.js` 抠出所有 `FIELDS` 的 path，
+> 逐条确认在 `Config` 里都是 volatile。新增设置项忘了第 2 步就会在那里挂掉。
 
 ### 5.6 换掉 OneBot，接别的协议
 
@@ -285,7 +308,8 @@ node lib/onebot-adapter.mjs --ws ws://127.0.0.1:3001 --http http://127.0.0.1:300
 | 指令没反应 | 前缀是否在**消息首位**；`ADMIN_VERBS` 里有没有这个词；token 数是否超了 `COMMAND_ARITY` |
 | 指令被拒 | 回复里会写明**身份与来源**和**缺哪项权限**，照着补 `auth.owners` / `auth.superAdmins` / 动态授权 |
 | 访客用不了工具 | 那是**设计如此**（`auth.guestDshTools` 默认 false）；日志里会有「访客工具闸拦截：<工具名>」 |
-| 保存设置报错 | 大概率是 schema 形状问题（见 §3.1），或命名空间没注册成功 |
+| 设置页里没有这个插件 | 条目 id 与客户端 `NS` 不一致（客户端会报「设置里找不到条目」），或者 `Config` 里一个 volatile 字段都没有 —— 后者会让条目被 `volatileForm()` 直接过滤掉（见 §3.1） |
+| 保存设置报错 | 字段没标 `.volatile()`（`Config field "x" is not volatile`），或另一个编辑器改过配置导致 `revision` 过期（`SETTINGS_CONFLICT`） |
 
 ### 6.4 加测试
 
@@ -314,7 +338,10 @@ node lib/onebot-adapter.mjs --ws ws://127.0.0.1:3001 --http http://127.0.0.1:300
 | **`ctx.sessionController`** | DSH 服务：创建/取出会话 Agent 的**官方组装路径** |
 | **`ctx.timeout`** | DSH 的定时器（需 `inject: ['timer']`） |
 | **`tools.guard`** | DSH 工具执行前的单调闸：返回字符串即拒绝 |
-| **`settings.register`** | DSH 设置命名空间注册，schema 需可调用 + 可 `toJSON()` |
+| **`Config`** | 插件导出的 schemastery schema；DSH ≥ 0.1.7 用它承载设置表单 |
+| **`.volatile()`** | 标记「可热改」的字段。只有 volatile 字段能进设置页、能被保存 |
+| **`loader/volatile-update`** | volatile 字段被改动后 `cordis-plugin-loader` 发出的事件（就地更新，不重挂插件）；插件据此刷新配置 |
+| **profile 条目 id** | 设置命名空间就是它（本插件默认 `dsh-qq-bot`），写在 profile 的 `cordis.patch.yml` 里 |
 | **tier** | 说话人的身份档位：owner / super / group-admin / granted / guest |
 
 ---
@@ -329,6 +356,8 @@ node lib/onebot-adapter.mjs --ws ws://127.0.0.1:3001 --http http://127.0.0.1:300
 6. **别改包内的 `cordis.patch.yml` 当配置用**——升级会被覆盖。用户配置写 profile 的 `cordis.patch.yml`。
 7. **改了代码要打成新版本号文件名再 `dsh plugin add`**：pnpm 按 tarball 完整性缓存，同名会被判成 lockfile 最新而跳过。
 8. **别把 `dist/*.tgz` 提交进 git**（已在 `.gitignore` 里）；发布时挂到 GitHub Release。
+9. **别再用 `ctx.settings.register()`** —— DSH 0.1.7 已移除（`settings-file` 包被删）。设置一律走插件自己的 `Config` schema。
+10. **别忘 `.volatile()`**：可编辑字段不标 volatile，条目不进设置页、保存被拒；`test-plugin.mjs` 的契约断言会兜住这一点。
 
 ---
 

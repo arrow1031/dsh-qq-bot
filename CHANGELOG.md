@@ -4,6 +4,39 @@
 
 > **0.6.0 是本次公开发布的最终版本**，作者不承诺后续更新——详见 README 的「维护状态」一节。
 
+## 0.6.1
+
+**适配 DSH 0.1.7：设置契约重做**。0.1.7 移除了 `ctx.settings.register()`，0.6.0 在 0.1.7 上会
+注册失败（设置页整个消失）。除设置相关外，收发消息的链路没有变化。
+
+- **根因**：0.1.7 删掉了 `packages/settings/settings-file`（独立的 `settings.yaml` 文档），
+  并把 `settings` 服务重写成「直接读 profile 里每个插件条目的 Config schema」。因此
+  **`ctx.settings.register(ns, schema, { base })` 不再存在**：设置表单改由**插件自己导出的
+  Cordis `Config` schema** 承载，界面上的改动写回 profile 的 `cordis.patch.yml`。
+- **Host**：新增 `export const Config`（schemastery）；所有出现在设置页里的字段标 `.volatile()`
+  （`settings` 只允许 volatile 字段被编辑）；删掉 `settings.register` 调用；配置改从 Cordis
+  求值后的 `config` 参数读取 —— volatile 字段是引用，要 `.get()`。
+- **热更新语义变了**：0.1.7 里 volatile 字段变化**不会重挂插件**，`cordis-plugin-loader`
+  只就地更新运行中 fiber 的引用并发 `loader/volatile-update`。所以改为监听该事件刷新配置；
+  连接方式（模式 / 地址 / token）变化时才重启适配器，与旧行为一致。
+- **客户端**：设置命名空间从自定义的 `qq-bot` 改为 **profile 条目 id `dsh-qq-bot`**
+  （条目被改名时回退到「以 qq-bot 结尾」的唯一匹配）；按 0.1.7 的要求在 `inject` 里声明
+  `remote` 与 `remote.settings`。
+- **设置页归属**：用 `settings.configure({ auto: false }, ctx.fiber)` 声明「本插件的设置页由
+  自带的『QQ 机器人』选项卡负责」，避免 DSH 再按 schema 自动生成一个重复页面。
+- **依赖**：新增运行时依赖 `@deepseek-ai/schemastery@^3.18.4`（`Config` 必需；
+  3.18.2 及更早没有 `.volatile()`）。
+- **Windows 修复**（0.6.0 只在 Linux 验证过）：
+  - 测试里 `import(path.join(...))` 在 Windows 上报 `ERR_UNSUPPORTED_ESM_URL_SCHEME`，
+    改用 `pathToFileURL()`；
+  - `PROFILE_MODULES` 不再写死 `/home/dsh/.dsh/profiles/node_modules`，可用
+    `DSH_PROFILE_MODULES` 覆盖；
+  - 测试清理临时软链时不再对 junction 用 `fs.rmSync(recursive)`（会把目标目录删空），
+    改用 `rmdirSync` / `unlinkSync`。
+- 测试：**124 项全绿**。新增契约断言：`client.js` 里每个表单字段都必须是 volatile、
+  `volatileForm(Config)` 非空、`accessToken` 是 secret、内部字段不进设置页；
+  以及热更新断言（volatile 就地更新 → 重启适配器；非连接类改动不重启）。
+
 ## 0.6.0
 
 - **访客工具闸**：非拥有者的消息驱动 Agent 时，禁用 DSH 内部工具（bash / 读写 / 子代理 / …）。

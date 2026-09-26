@@ -91,7 +91,9 @@ try {
   // 只允许 require('react')：真的 bundle 不该依赖别的东西
   const plugin = registration.factory(fakeRequire);
   check('导出了 name/inject/apply', typeof plugin.name === 'string' && Array.isArray(plugin.inject) && typeof plugin.apply === 'function');
-  check('inject 只声明 slots（设置 API 惰性解析）', plugin.inject.length === 1 && plugin.inject[0] === 'slots', JSON.stringify(plugin.inject));
+  check('inject 声明了 slots 与 remote.settings（DSH ≥ 0.1.7 的要求）',
+    Array.isArray(plugin.inject) && plugin.inject.includes('slots') && plugin.inject.includes('remote.settings'),
+    JSON.stringify(plugin.inject));
 
   console.log('\n2. 注册设置选项卡');
   let injectName = null;
@@ -120,7 +122,7 @@ try {
   };
   const mutateCalls = [];
   const fakeSettingsApi = {
-    async describe() { return { ok: true, value: { namespaces: [{ ns: 'qq-bot', value: SETTINGS_VALUE, revision: 7, secrets: [{ path: ['onebot', 'accessToken'], set: true }] }] } }; },
+    async describe() { return { ok: true, value: { writable: true, hasDocument: true, namespaces: [{ ns: 'dsh-qq-bot', value: SETTINGS_VALUE, revision: 7, secrets: [{ path: ['onebot', 'accessToken'], set: true }] }] } }; },
     async mutate(ns, ops, revision) { mutateCalls.push({ ns, ops, revision }); return { ok: true, value: { ns, revision: 8 } }; },
   };
   slotsCtx.get = (name) => (name === 'remote.settings' ? fakeSettingsApi : undefined);
@@ -128,7 +130,7 @@ try {
   plugin.apply(slotsCtx);
   check('注入到 settings.section', injectName === 'settings.section', String(injectName));
   check('注册项 name=settings.section', registered && registered.options.name === 'settings.section');
-  check("注册项 id='qq-bot'", registered && registered.options.id === 'qq-bot', String(registered && registered.options.id));
+  check("注册项 id='dsh-qq-bot'（与 profile 条目 id 一致）", registered && registered.options.id === 'dsh-qq-bot', String(registered && registered.options.id));
   check('注册项 label=「QQ 机器人」', registered && registered.options.label === 'QQ 机器人', String(registered && registered.options.label));
   check('注册项有 order', registered && typeof registered.options.order === 'number', String(registered && registered.options.order));
   check('提供了组件', registered && typeof registered.component === 'function');
@@ -138,14 +140,31 @@ try {
 
   console.log('\n3. 设置读写走对 Remote');
   const loaded = await faces.loadConfig();
-  check('loadConfig 找到 qq-bot 命名空间', loaded.ok === true && loaded.value && loaded.value.onebot.wsUrl === 'ws://127.0.0.1:3001', JSON.stringify(loaded).slice(0, 120));
+  check('loadConfig 找到 dsh-qq-bot 命名空间', loaded.ok === true && loaded.value && loaded.value.onebot.wsUrl === 'ws://127.0.0.1:3001', JSON.stringify(loaded).slice(0, 120));
   check('loadConfig 带回了 revision', loaded.revision === 7, String(loaded.revision));
 
   const saved = await faces.saveConfig([{ op: 'set', path: ['onebot', 'wsUrl'], value: 'ws://10.0.0.5:3001' }], loaded.revision);
-  check('saveConfig 调用了 mutate', mutateCalls.length === 1 && mutateCalls[0].ns === 'qq-bot', JSON.stringify(mutateCalls).slice(0, 120));
+  check('saveConfig 调用了 mutate', mutateCalls.length === 1 && mutateCalls[0].ns === 'dsh-qq-bot', JSON.stringify(mutateCalls).slice(0, 120));
   check('mutate 收到了正确的路径操作', mutateCalls[0].ops[0].op === 'set' && mutateCalls[0].ops[0].path.join('.') === 'onebot.wsUrl');
   check('mutate 收到了 revision（乐观并发）', mutateCalls[0].revision === 7, String(mutateCalls[0].revision));
   check('saveConfig 返回 ok', saved.ok === true);
+
+  console.log('\n3b. 条目被改名时仍能找到（回退匹配）');
+  const renamedApi = {
+    async describe() { return { ok: true, value: { writable: true, hasDocument: true, namespaces: [{ ns: 'my-qq-bot', value: SETTINGS_VALUE, revision: 3, secrets: [] }] } }; },
+    async mutate(ns, ops, revision) { return { ok: true, value: { ns, revision } }; },
+  };
+  let renamedRegistered = null;
+  const renamedCtx = {
+    slots: {
+      inject(name, callback) { return callback(); },
+      register(options, component) { renamedRegistered = { options, component }; return () => {}; },
+    },
+    get: (name) => (name === 'remote.settings' ? renamedApi : undefined),
+  };
+  plugin.apply(renamedCtx);
+  const renamedLoaded = await renamedRegistered.options.inject().loadConfig();
+  check('改名后回退匹配成功', renamedLoaded.ok === true && renamedLoaded.revision === 3, JSON.stringify(renamedLoaded).slice(0, 140));
 
   console.log('\n4. 真实渲染一次（走完异步加载）');
   const props = { ...faces, close: () => {} };

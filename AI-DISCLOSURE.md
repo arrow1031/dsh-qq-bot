@@ -21,12 +21,12 @@
 
 ### 验证情况
 
-- **自动化测试 123 项**，全部通过（`npm test`）：
+- **自动化测试 124 项**，全部通过（`npm test`；Windows 11 + Node 24 实测）：
   - 正向 WebSocket 适配器 19 项
   - 反向 WebSocket 适配器 12 项
-  - Host 插件 25 项
-  - 客户端设置页 31 项
-  - 权限 / 群管理 / 访客工具闸 36 项
+  - Host 插件 29 项（含 `Config` 契约与配置热更新：volatile 就地更新 → 重启适配器）
+  - 客户端设置页 32 项
+  - 权限 / 群管理 / 访客工具闸 32 项（`@deepseek-ai/dsh-tools` 可解析时另含 qqgroup 工具路径断言）
 - 测试用的 QQ 侧对端是项目自带的**零依赖 OneBot 11 模拟器**（`test/mock-onebot.mjs`，手写 RFC 6455 帧编解码），
   因此**不需要真实 QQ 账号**即可回归。
 - 上面"Host 插件"测试用**假 ctx**（自行实现 `subprocess` / `sessionController` / `timer` / `effect` / `tools`）
@@ -47,10 +47,15 @@
 2. **`lib/index.js` 作为已安装插件在真实 Cordis 宿主中的运行时行为，作者未直接观察到**。
    等价逻辑以动态 Package 形态跑通过；打包、清单、模块解析、组合预检是分别验证的。
    因此"装包 → 重启 → 实际可用"这一步请以你自己环境的实测为准。
-3. **仅在 Linux（含 Android proot 容器）下验证过**，未测试 Windows / macOS。
-4. **未实现自动治理**（关键词/刷屏自动撤回或禁言）。`notice` 事件目前只做透传与计数。
-5. 回复段的处理只取了被引用消息的 id；合并转发、嵌套回复链未处理。
-6. 群管理动作的实际效果（撤回是否成功、禁言时长是否被平台裁剪等）依赖具体 OneBot 实现，
+3. **Windows 兼容性已在 0.6.1 实测**（Windows 11 + Node 24，124 项全绿）。macOS 仍未测试。
+   0.6.0 及更早只在 Linux（含 Android proot 容器）下验证过；在 Windows 上，测试脚本里的
+   `import(path.join(...))` 会报 `ERR_UNSUPPORTED_ESM_URL_SCHEME`。
+4. **设置契约按 DSH 0.1.7 实现**：0.1.7 移除了 `settings.register()`，改为读插件自己导出的
+   `Config` schema（可编辑字段必须标 `.volatile()`）。上游若再次改动设置契约，设置页会先失效，
+   收发消息不受影响。
+5. **未实现自动治理**（关键词/刷屏自动撤回或禁言）。`notice` 事件目前只做透传与计数。
+6. 回复段的处理只取了被引用消息的 id；合并转发、嵌套回复链未处理。
+7. 群管理动作的实际效果（撤回是否成功、禁言时长是否被平台裁剪等）依赖具体 OneBot 实现，
    本项目只保证按协议发出请求并如实回报结果。
 
 ### 第三方与协议归属
@@ -85,7 +90,7 @@
 ### 维护状态：不承诺更新
 
 **本项目到此封版，作者不做持续性维护**：不承诺修 bug、不适配上游破坏性变更、不接受功能请求。
-功能是完整的、123 项测试是全绿的，但后续请自行负责。
+功能是完整的、124 项测试是全绿的，但后续请自行负责。
 
 遇到问题（包括 DSH 升级、NapCat 改字段、OneBot 实现换代、或者想加自动治理）——
 **fork 下来自己改**。MIT 许可，随便改、随便发，不用打招呼。
@@ -115,7 +120,7 @@ No source code from third-party projects was copied into this repository.
 
 - **Generated with:** an AI coding agent running on DeepSeek Harness (DSH), inside a mobile container.
 - **Verification:** the browser-side settings page was **manually confirmed on a real device** (tab visible, fields render, read/write behaves).
-  123 automated checks pass (`npm test`), covering the forward/reverse WebSocket adapter,
+  124 automated checks pass on Windows 11 + Node 24 (`npm test`), covering the forward/reverse WebSocket adapter,
   the Host plugin (loaded with a fake `ctx` against a real adapter and a real mock OneBot peer),
   the browser-side settings page, and the permission/group-management subsystem.
   The QQ-side peer used throughout is a zero-dependency OneBot 11 simulator bundled in `test/`,
@@ -130,7 +135,11 @@ No source code from third-party projects was copied into this repository.
    Equivalent logic was exercised as a dynamic Cordis package; packaging, manifest, module resolution
    and composition preflight were verified separately. Please validate install → restart → run in your
    own environment.
-3. **Linux only** (including an Android proot container). Windows and macOS are untested.
+3. **Windows support was measured in 0.6.1** (Windows 11 + Node 24; 124 checks pass). macOS remains untested.
+   0.6.0 and earlier were verified on Linux only (including an Android proot container).
+4. **The settings contract follows DSH 0.1.7**: `settings.register()` was removed, so the plugin exports a
+   `Config` schema whose editable fields are marked `.volatile()`. If upstream reshapes that contract again,
+   the settings page breaks first; messaging keeps working.
 5. **Automatic moderation is not implemented.** `notice` events are passed through and counted only.
 6. Reply handling captures only the referenced message id; merged forwards and nested reply chains are not handled.
 
